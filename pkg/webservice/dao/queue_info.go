@@ -27,9 +27,15 @@ type QueueDAOInfo struct {
 
 type QueueCapacity struct {
 	Capacity        string `json:"capacity"`
-	MaxCapacity     string `json:"maxcapacity"`
-	UsedCapacity    string `json:"usedcapacity"`
-	AbsUsedCapacity string `json:"absusedcapacity"`
+	MaxCapacity     string `json:"maxCapacity"`
+	UsedCapacity    string `json:"usedCapacity"`
+	AbsUsedCapacity string `json:"absUsedCapacity"`
+}
+
+type TemplateInfo struct {
+	MaxResource        string            `json:"maxResource"`
+	GuaranteedResource string            `json:"guaranteedResource"`
+	Properties         map[string]string `json:"properties"`
 }
 
 type PartitionQueueDAOInfo struct {
@@ -43,5 +49,6 @@ type PartitionQueueDAOInfo struct {
 	IsManaged          bool                    `json:"isManaged"`
 	Properties         map[string]string       `json:"properties"`
 	Parent             string                  `json:"parent"`
+	TemplateInfo       *TemplateInfo           `json:"template"`
 	Children           []PartitionQueueDAOInfo `json:"children"`
 }

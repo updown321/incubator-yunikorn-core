@@ -32,7 +32,6 @@ import (
 	"github.com/apache/incubator-yunikorn-core/pkg/common/configs"
 	"github.com/apache/incubator-yunikorn-core/pkg/common/resources"
 	"github.com/apache/incubator-yunikorn-core/pkg/common/security"
-	"github.com/apache/incubator-yunikorn-core/pkg/interfaces"
 	"github.com/apache/incubator-yunikorn-core/pkg/log"
 	"github.com/apache/incubator-yunikorn-core/pkg/metrics"
 	"github.com/apache/incubator-yunikorn-core/pkg/scheduler/objects"
@@ -51,7 +50,7 @@ type PartitionContext struct {
 	applications           map[string]*objects.Application // applications assigned to this partition
 	completedApplications  map[string]*objects.Application // completed applications from this partition
 	reservedApps           map[string]int                  // applications reserved within this partition, with reservation count
-	nodes                  map[string]*objects.Node        // nodes assigned to this partition
+	nodes                  objects.NodeCollection          // nodes assigned to this partition
 	placementManager       *placement.AppPlacementManager  // placement manager for this partition
 	partitionManager       *partitionManager               // manager for this partition
 	stateMachine           *fsm.FSM                        // the state of the partition for scheduling
@@ -60,7 +59,6 @@ type PartitionContext struct {
 	rules                  *[]configs.PlacementRule        // placement rules to be loaded by the scheduler
 	userGroupCache         *security.UserGroupCache        // user cache per partition
 	totalPartitionResource *resources.Resource             // Total node resources
-	nodeSortingPolicy      *policies.NodeSortingPolicy     // Global Node Sorting Policies
 	allocations            int                             // Number of allocations on the partition
 
 	// The partition write lock must not be held while manipulating an application.
@@ -91,7 +89,7 @@ func newPartitionContext(conf configs.PartitionConfig, rmID string, cc *ClusterC
 		applications:          make(map[string]*objects.Application),
 		completedApplications: make(map[string]*objects.Application),
 		reservedApps:          make(map[string]int),
-		nodes:                 make(map[string]*objects.Node),
+		nodes:                 objects.NewNodeCollection(conf.Name),
 	}
 	pc.partitionManager = &partitionManager{
 		pc: pc,
@@ -100,6 +98,7 @@ func newPartitionContext(conf configs.PartitionConfig, rmID string, cc *ClusterC
 	if err := pc.initialPartitionFromConfig(conf); err != nil {
 		return nil, err
 	}
+
 	return pc, nil
 }
 
@@ -134,24 +133,23 @@ func (pc *PartitionContext) initialPartitionFromConfig(conf configs.PartitionCon
 	// get the user group cache for the partition
 	// TODO get the resolver from the config
 	pc.userGroupCache = security.GetUserGroupCache("")
+	pc.updateNodeSortingPolicy(conf)
+	return nil
+}
 
-	// TODO Need some more cleaner interface here.
+// NOTE: this is a lock free call. It should only be called holding the PartitionContext lock.
+func (pc *PartitionContext) updateNodeSortingPolicy(conf configs.PartitionConfig) {
 	var configuredPolicy policies.SortingPolicy
-	configuredPolicy, err = policies.FromString(conf.NodeSortPolicy.Type)
+	configuredPolicy, err := policies.SortingPolicyFromString(conf.NodeSortPolicy.Type)
 	if err != nil {
 		log.Logger().Debug("NodeSorting policy incorrectly set or unknown",
 			zap.Error(err))
-	}
-	switch configuredPolicy {
-	case policies.BinPackingPolicy, policies.FairnessPolicy:
+		log.Logger().Info(fmt.Sprintf("NodeSorting policy not set using '%s' as default", configuredPolicy))
+	} else {
 		log.Logger().Info("NodeSorting policy set from config",
 			zap.String("policyName", configuredPolicy.String()))
-		pc.nodeSortingPolicy = policies.NewNodeSortingPolicy(conf.NodeSortPolicy.Type)
-	case policies.Unknown:
-		log.Logger().Info("NodeSorting policy not set using 'fair' as default")
-		pc.nodeSortingPolicy = policies.NewNodeSortingPolicy("fair")
 	}
-	return nil
+	pc.nodes.SetNodeSortingPolicy(objects.NewNodeSortingPolicy(conf.NodeSortPolicy.Type))
 }
 
 func (pc *PartitionContext) updatePartitionDetails(conf configs.PartitionConfig) error {
@@ -176,11 +174,12 @@ func (pc *PartitionContext) updatePartitionDetails(conf configs.PartitionConfig)
 		// Placing an application will not have a lock on the partition context.
 		pc.placementManager = placement.NewPlacementManager(*pc.rules, pc.GetQueue)
 	}
+	pc.updateNodeSortingPolicy(conf)
 	// start at the root: there is only one queue
 	queueConf := conf.Queues[0]
 	root := pc.root
 	// update the root queue
-	if err := root.SetQueueConfig(queueConf); err != nil {
+	if err := root.ApplyConf(queueConf); err != nil {
 		return err
 	}
 	root.UpdateSortType()
@@ -223,7 +222,7 @@ func (pc *PartitionContext) updateQueues(config []configs.QueueConfig, parent *o
 		if queue == nil {
 			queue, err = objects.NewConfiguredQueue(queueConfig, parent)
 		} else {
-			err = queue.SetQueueConfig(queueConfig)
+			err = queue.ApplyConf(queueConfig)
 		}
 		if err != nil {
 			return err
@@ -306,14 +305,14 @@ func (pc *PartitionContext) AddApplication(app *objects.Application) error {
 	}
 
 	// Put app under the queue
-	queueName := app.QueueName
+	queueName := app.QueuePath
 	pm := pc.getPlacementManager()
 	if pm.IsInitialised() {
 		err := pm.PlaceApplication(app)
 		if err != nil {
 			return fmt.Errorf("failed to place application %s: %v", appID, err)
 		}
-		queueName = app.QueueName
+		queueName = app.QueuePath
 		if queueName == "" {
 			return fmt.Errorf("application rejected by placement rules: %s", appID)
 		}
@@ -487,7 +486,7 @@ func (pc *PartitionContext) GetQueueInfos() dao.QueueDAOInfo {
 // Get the queue info for the whole queue structure to pass to the webservice
 func (pc *PartitionContext) GetPartitionQueues() dao.PartitionQueueDAOInfo {
 	var PartitionQueueDAOInfo = dao.PartitionQueueDAOInfo{}
-	PartitionQueueDAOInfo = pc.root.GetPartitionQueues()
+	PartitionQueueDAOInfo = pc.root.GetPartitionQueueDAOInfo()
 	PartitionQueueDAOInfo.Partition = pc.Name
 	return PartitionQueueDAOInfo
 }
@@ -539,30 +538,7 @@ func (pc *PartitionContext) GetNode(nodeID string) *objects.Node {
 	pc.RLock()
 	defer pc.RUnlock()
 
-	return pc.nodes[nodeID]
-}
-
-// Get a copy of the nodes from the partition.
-// This list does not include reserved nodes or nodes marked unschedulable
-func (pc *PartitionContext) getSchedulableNodes() []*objects.Node {
-	return pc.getNodes(true)
-}
-
-// Get a copy of the nodes from the partition.
-// Excludes unschedulable nodes only, reserved node inclusion depends on the parameter passed in.
-func (pc *PartitionContext) getNodes(excludeReserved bool) []*objects.Node {
-	pc.RLock()
-	defer pc.RUnlock()
-
-	nodes := make([]*objects.Node, 0)
-	for _, node := range pc.nodes {
-		// filter out the nodes that are not scheduling
-		if !node.IsSchedulable() || (excludeReserved && node.IsReserved()) {
-			continue
-		}
-		nodes = append(nodes, node)
-	}
-	return nodes
+	return pc.nodes.GetNode(nodeID)
 }
 
 // Add the node to the partition and process the allocations that are reported by the node.
@@ -622,11 +598,10 @@ func (pc *PartitionContext) updatePartitionResource(delta *resources.Resource) {
 func (pc *PartitionContext) addNodeToList(node *objects.Node) error {
 	pc.Lock()
 	defer pc.Unlock()
-	if pc.nodes[node.NodeID] != nil {
-		return fmt.Errorf("partition %s has an existing node %s, node name must be unique", pc.Name, node.NodeID)
-	}
 	// Node can be added to the system to allow processing of the allocations
-	pc.nodes[node.NodeID] = node
+	if err := pc.nodes.AddNode(node); err != nil {
+		return fmt.Errorf("failed to add node %s to partition %s, error: %v", node.NodeID, pc.Name, err)
+	}
 	metrics.GetSchedulerMetrics().IncActiveNodes()
 
 	// update/set the resources available in the cluster
@@ -649,7 +624,7 @@ func (pc *PartitionContext) addNodeToList(node *objects.Node) error {
 func (pc *PartitionContext) removeNodeFromList(nodeID string) *objects.Node {
 	pc.Lock()
 	defer pc.Unlock()
-	node := pc.nodes[nodeID]
+	node := pc.nodes.RemoveNode(nodeID)
 	if node == nil {
 		log.Logger().Debug("node was not found, node already removed",
 			zap.String("nodeID", nodeID),
@@ -658,7 +633,6 @@ func (pc *PartitionContext) removeNodeFromList(nodeID string) *objects.Node {
 	}
 
 	// Remove node from list of tracked nodes
-	delete(pc.nodes, nodeID)
 	metrics.GetSchedulerMetrics().DecActiveNodes()
 
 	// found the node cleanup the available resources, partition resources cannot be nil at this point
@@ -883,7 +857,7 @@ func (pc *PartitionContext) reserve(app *objects.Application, node *objects.Node
 
 	log.Logger().Info("allocation ask is reserved",
 		zap.String("appID", appID),
-		zap.String("queue", app.QueueName),
+		zap.String("queue", app.QueuePath),
 		zap.String("allocationKey", ask.AllocationKey),
 		zap.String("node", node.NodeID))
 }
@@ -912,31 +886,16 @@ func (pc *PartitionContext) unReserve(app *objects.Application, node *objects.No
 
 	log.Logger().Info("allocation ask is unreserved",
 		zap.String("appID", appID),
-		zap.String("queue", app.QueueName),
+		zap.String("queue", app.QueuePath),
 		zap.String("allocationKey", ask.AllocationKey),
 		zap.String("node", node.NodeID),
 		zap.Int("reservationsRemoved", num))
 }
 
-// Get the iterator for the sorted nodes list from the partition.
-// Sorting should use a copy of the node list not the main list.
-func (pc *PartitionContext) getNodeIteratorForPolicy(nodes []*objects.Node) interfaces.NodeIterator {
-	configuredPolicy := pc.GetNodeSortingPolicy()
-	if configuredPolicy == policies.Unknown {
-		return nil
-	}
-	// Sort Nodes based on the policy configured.
-	objects.SortNodes(nodes, configuredPolicy)
-	return newDefaultNodeIterator(nodes)
-}
-
-// Create a node iterator for the schedulable nodes based on the policy set for this partition.
-// The iterator is nil if there are no schedulable nodes available.
-func (pc *PartitionContext) GetNodeIterator() interfaces.NodeIterator {
-	if nodeList := pc.getSchedulableNodes(); len(nodeList) != 0 {
-		return pc.getNodeIteratorForPolicy(nodeList)
-	}
-	return nil
+// Create an ordered node iterator based on the node sort policy set for this partition.
+// The iterator is nil if there are no unreserved nodes available.
+func (pc *PartitionContext) GetNodeIterator() objects.NodeIterator {
+	return pc.nodes.GetNodeIterator()
 }
 
 // Update the reservation counter for the app
@@ -991,7 +950,7 @@ func (pc *PartitionContext) GetTotalAllocationCount() int {
 func (pc *PartitionContext) GetTotalNodeCount() int {
 	pc.RLock()
 	defer pc.RUnlock()
-	return len(pc.nodes)
+	return pc.nodes.GetNodeCount()
 }
 
 func (pc *PartitionContext) GetApplications() []*objects.Application {
@@ -1046,11 +1005,7 @@ func (pc *PartitionContext) GetAppsInTerminatedState() []*objects.Application {
 func (pc *PartitionContext) GetNodes() []*objects.Node {
 	pc.RLock()
 	defer pc.RUnlock()
-	var nodeList []*objects.Node
-	for _, node := range pc.nodes {
-		nodeList = append(nodeList, node)
-	}
-	return nodeList
+	return pc.nodes.GetNodes()
 }
 
 // Add an allocation to the partition/node/application/queue during node registration.
@@ -1086,11 +1041,6 @@ func (pc *PartitionContext) addAllocation(alloc *objects.Allocation) error {
 	if node == nil {
 		metrics.GetSchedulerMetrics().IncSchedulingError()
 		return fmt.Errorf("failed to find node %s", alloc.NodeID)
-	}
-	// check the node status again
-	if !node.IsSchedulable() {
-		metrics.GetSchedulerMetrics().IncSchedulingError()
-		return fmt.Errorf("node %s is not in schedulable state", node.NodeID)
 	}
 
 	app := pc.getApplication(alloc.ApplicationID)
@@ -1144,7 +1094,7 @@ func (pc *PartitionContext) convertUGI(ugi *si.UserGroupInformation) (security.U
 //
 // NOTE: this is a lock free call. It must NOT be called holding the PartitionContext lock.
 func (pc *PartitionContext) calculateNodesResourceUsage() map[string][]int {
-	nodesCopy := pc.getNodes(false)
+	nodesCopy := pc.GetNodes()
 	mapResult := make(map[string][]int)
 	for _, node := range nodesCopy {
 		for name, total := range node.GetCapacity().Resources {
@@ -1332,7 +1282,11 @@ func (pc *PartitionContext) GetStateTime() time.Time {
 func (pc *PartitionContext) GetNodeSortingPolicy() policies.SortingPolicy {
 	pc.RLock()
 	defer pc.RUnlock()
-	return pc.nodeSortingPolicy.PolicyType
+	policy := pc.nodes.GetNodeSortingPolicy()
+	if policy == nil {
+		return policies.FairnessPolicy
+	}
+	return policy.PolicyType()
 }
 
 func (pc *PartitionContext) moveTerminatedApp(appID string) {
@@ -1353,4 +1307,16 @@ func (pc *PartitionContext) moveTerminatedApp(appID string) {
 	defer pc.Unlock()
 	delete(pc.applications, appID)
 	pc.completedApplications[newID] = app
+}
+
+// Check for unlimited nodes in the partition
+func (pc *PartitionContext) hasUnlimitedNode() bool {
+	// We can have only one unlimited node registered
+	if pc.nodes.GetNodeCount() != 1 {
+		return false
+	}
+	for _, v := range pc.nodes.GetNodes() {
+		return v.IsUnlimited()
+	}
+	return false
 }

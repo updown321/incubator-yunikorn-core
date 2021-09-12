@@ -125,27 +125,6 @@ func stateAwareFilter(apps map[string]*Application) []*Application {
 	return filteredApps
 }
 
-func SortNodes(nodes []*Node, sortType policies.SortingPolicy) {
-	sortingStart := time.Now()
-	switch sortType {
-	case policies.FairnessPolicy:
-		// Sort by available resource, descending order
-		sort.SliceStable(nodes, func(i, j int) bool {
-			l := nodes[i]
-			r := nodes[j]
-			return resources.CompUsageShares(l.GetAvailableResource(), r.GetAvailableResource()) > 0
-		})
-	case policies.BinPackingPolicy:
-		// Sort by available resource, ascending order
-		sort.SliceStable(nodes, func(i, j int) bool {
-			l := nodes[i]
-			r := nodes[j]
-			return resources.CompUsageShares(r.GetAvailableResource(), l.GetAvailableResource()) > 0
-		})
-	}
-	metrics.GetSchedulerMetrics().ObserveNodeSortingLatency(sortingStart)
-}
-
 func sortAskByPriority(requests []*AllocationAsk, ascending bool) {
 	sort.SliceStable(requests, func(i, j int) bool {
 		l := requests[i]
